@@ -3,61 +3,113 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
-const { convertTo3Locators } = require('./3locators-algo'); // استدعاء ملف الخوارزمية
 
 const app = express();
-app.use(cors()); // للسماح للواجهة بالاتصال بالسيرفر
+app.use(cors());
 app.use(express.json());
 
-// التحقق من وجود مفتاح الـ API
+// التحقق من المفتاح
 if (!process.env.GEMINI_API_KEY) {
-    console.warn("⚠️ تحذير: لم يتم العثور على GEMINI_API_KEY في المتغيرات البيئية");
+    console.error("❌ Critical Error: GEMINI_API_KEY is missing in Environment Variables!");
 }
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// ==========================================
+// 🧠 الدالة الذكية لاختيار الموديل (Self-Healing)
+// ==========================================
+let cachedModelName = null;
+
+async function getWorkingModel() {
+    if (cachedModelName) return cachedModelName;
+
+    try {
+        console.log("🔍 Asking Google for available models...");
+        // استخدام REST API مباشرة لمعرفة المتاح
+        const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`;
+        const response = await axios.get(url);
+        
+        const models = response.data.models;
+        // البحث عن أول موديل "Gemini" يدعم توليد المحتوى
+        const bestModel = models.find(m => 
+            m.name.includes("gemini") && 
+            m.supportedGenerationMethods.includes("generateContent")
+        );
+
+        if (bestModel) {
+            // حذف كلمة "models/" من الاسم لأن المكتبة تضيفها تلقائياً أحياناً
+            const cleanName = bestModel.name.replace("models/", "");
+            console.log(`✅ Selected Model: ${cleanName}`);
+            cachedModelName = cleanName;
+            return cleanName;
+        }
+    } catch (error) {
+        console.error("⚠️ Failed to list models, falling back to 'gemini-pro'");
+    }
+    
+    return "gemini-pro"; // اسم احتياطي أخير
+}
+
+// ==========================================
+// 🗺️ إعدادات النظام
+// ==========================================
 const SYSTEM_PROMPT = `
-You are a GIS assistant converting Egyptian slang into a structured search query for OpenStreetMap (Nominatim).
-Rules:
-1. Nominatim works best with "Specific Name, City".
-2. Strip away prepositions like "near", "beside", "in front of".
-3. If the user asks for a generic category (e.g., "pharmacy"), map it to the center of the area or a famous one.
-4. Input: "عايز اروح مكتبة اسكندرية" -> Output JSON: { "query": "Bibliotheca Alexandrina, Alexandria" }
-5. Input: "محطة الرمل" -> Output JSON: { "query": "Mahatet El Raml, Alexandria" }
+You are a GIS assistant. Convert Egyptian slang to OpenStreetMap search queries.
+Input: "عايز اروح مكتبة اسكندرية" -> Output JSON: { "query": "Bibliotheca Alexandrina, Alexandria" }
+Input: "محطة الرمل" -> Output JSON: { "query": "Mahatet El Raml, Alexandria" }
 RETURN ONLY JSON.
 `;
 
+// استدعاء ملف الخوارزمية (تأكد من وجود الملف بجواره)
+let convertTo3Locators;
+try {
+    const algo = require('./3locators-algo');
+    convertTo3Locators = algo.convertTo3Locators;
+} catch (e) {
+    // دالة مؤقتة في حالة عدم وجود الملف
+    convertTo3Locators = (lat, lng) => `3LOC-${lat.toFixed(4)}-${lng.toFixed(4)}`;
+}
+
 app.post('/api/search', async (req, res) => {
     const userText = req.body.text;
-    console.log(`📩 طلب جديد: ${userText}`);
+    console.log(`📩 Request: ${userText}`);
 
     try {
-        // 1. استخدام Gemini لفهم النص
-  const model = genAI.getGenerativeModel({ model: "gemini-1.0-pro" });
+        // 1. اختيار الموديل ديناميكياً
+        const modelName = await getWorkingModel();
+        const model = genAI.getGenerativeModel({ model: modelName });
+
+        // 2. سؤال Gemini
         const result = await model.generateContent(SYSTEM_PROMPT + `\nInput: "${userText}"\nOutput JSON:`);
         const response = await result.response;
         const textResponse = response.text().replace(/```json|```/g, "").trim();
-        const aiData = JSON.parse(textResponse);
         
-        console.log(`🤖 Gemini اقترح: ${aiData.query}`);
+        let aiData;
+        try {
+            aiData = JSON.parse(textResponse);
+        } catch (e) {
+            // محاولة تصحيح JSON لو الـ AI رد بنص عادي
+            console.warn("⚠️ AI Response wasn't strict JSON, retrying...");
+            aiData = { query: userText + ", Egypt" }; 
+        }
+        
+        console.log(`🤖 AI Query: ${aiData.query}`);
 
-        // 2. البحث في OpenStreetMap
-        // نستخدم User-Agent لتجنب الحظر من OSM
+        // 3. البحث في الخريطة (OSM)
         const nominatimUrl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(aiData.query)}&addressdetails=1&limit=1`;
-        
         const geoResponse = await axios.get(nominatimUrl, {
-            headers: { 'User-Agent': '3locators-App/1.0 (cultnat.org)' } 
+            headers: { 'User-Agent': '3locators-App/1.0' } 
         });
 
         if (geoResponse.data.length === 0) {
-            return res.status(404).json({ error: "لم يتم العثور على المكان، حاول كتابة الاسم الرسمي." });
+            return res.status(404).json({ error: "لم نجد مكاناً بهذا الاسم، حاول توضيح الاسم أكثر." });
         }
 
         const place = geoResponse.data[0];
         const lat = parseFloat(place.lat);
         const lng = parseFloat(place.lon);
 
-        // 3. تطبيق خوارزمية 3locators
+        // 4. توليد الكود
         const code3L = convertTo3Locators(lat, lng);
 
         res.json({
@@ -70,11 +122,13 @@ app.post('/api/search', async (req, res) => {
         });
 
     } catch (error) {
-        console.error("❌ Error:", error.message);
-        res.status(500).json({ error: "حدث خطأ في المعالجة" });
+        console.error("❌ SERVER ERROR:", error.message);
+        // طباعة تفاصيل الخطأ لو كان من جوجل
+        if (error.response) console.error("Google Error Detail:", error.response.data);
+        
+        res.status(500).json({ error: "حدث خطأ في النظام، يرجى المحاولة لاحقاً." });
     }
 });
 
-// Render يقوم بتعيين المنفذ تلقائياً عبر process.env.PORT
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
