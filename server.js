@@ -33,7 +33,7 @@ app.post('/api/search', async (req, res) => {
 
     try {
         // 1. استخدام Gemini لفهم النص
-        const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+      const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         const result = await model.generateContent(SYSTEM_PROMPT + `\nInput: "${userText}"\nOutput JSON:`);
         const response = await result.response;
         const textResponse = response.text().replace(/```json|```/g, "").trim();
